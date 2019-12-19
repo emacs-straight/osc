@@ -3,7 +3,7 @@
 ;; Copyright (C) 2014-2019  Free Software Foundation, Inc.
 
 ;; Author: Mario Lang <mlang@blind.guru>
-;; Version: 0.1
+;; Version: 0.2
 ;; Keywords: comm, processes, multimedia
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -35,15 +35,15 @@
 
 ;; BUGS/TODO:
 ;;
-;; * Timetags and binary blobs are not supported yet.
+;; * Timetags are not supported yet.
 
 ;; Usage:
 ;;
-;; Client: (setq my-client (osc-make-client "localhost" 7770))
+;; Client: (setq my-client (osc-make-client "127.0.0.1" 7770))
 ;;         (osc-send-message my-client "/osc/path" 1.5 1.0 5 "done")
 ;;         (delete-process my-client)
 ;;
-;; Server: (setq my-server (osc-make-server "localhost" 7770
+;; Server: (setq my-server (osc-make-server "127.0.0.1" 7770
 ;;          (lambda (path &rest args)
 ;;            (message "OSC %s: %S" path args))))
 
@@ -51,10 +51,17 @@
 
 (require 'cl-lib)
 
-(defun osc-insert-string (string)
-  (insert string 0 (make-string (- 3 (% (length string) 4)) 0)))
+(defun osc-string (string)
+  (setq string (encode-coding-string string 'binary))
+  (concat string (make-string (1+ (- 3 (% (length string) 4))) 0)))
 
-(defun osc-insert-float32 (value)
+(defun osc-blob (vector)
+  (let ((length (length vector)))
+    (concat (osc-int32 length)
+	    vector
+	    (make-string (% (- 4 (% length 4)) 4) 0))))
+
+(defun osc-float32 (value)
   (let (s (e 0) f)
     (cond
      ((= value 0.0)
@@ -73,18 +80,17 @@
       (if (= e 0) (while (< (* f (expt 2.0 e)) 1.0) (setq e (1+ e))))
       (setq f (round (* (1- (* f (expt 2.0 e))) (expt 2 23)))
 	    e (+ (* -1 e) 127))))
-    (insert (+ (lsh s 7) (lsh (logand e #XFE) -1))
-	    (+ (lsh (logand e #X01) 7) (lsh (logand f #X7F0000) -16))
-	    (lsh (logand f #XFF00) -8)
-	    (logand f #XFF))))
+    (unibyte-string (+ (lsh s 7) (lsh (logand e #XFE) -1))
+		    (+ (lsh (logand e #X01) 7) (lsh (logand f #X7F0000) -16))
+		    (lsh (logand f #XFF00) -8)
+		    (logand f #XFF))))
 
-(defun osc-insert-int32 (value)
+(defun osc-int32 (value)
   (let (bytes)
     (dotimes (i 4)
       (push (% value 256) bytes)
       (setq value (/ value 256)))
-    (dolist (byte bytes)
-      (insert byte))))
+    (apply 'unibyte-string bytes)))
 
 ;;;###autoload
 (defun osc-make-client (host port)
@@ -99,23 +105,30 @@
 ;;;###autoload
 (defun osc-send-message (client path &rest args)
   "Send an OSC message from CLIENT to the specified PATH with ARGS."
-  (with-temp-buffer
-    (set-buffer-multibyte nil)
-    (osc-insert-string path)
-    (osc-insert-string
-     (apply 'concat "," (mapcar (lambda (arg)
-				  (cond
-				   ((floatp arg) "f")
-				   ((integerp arg) "i")
-				   ((stringp arg) "s")
-				   (t (error "Invalid argument: %S" arg))))
-				args)))
-    (dolist (arg args)
-      (cond
-       ((floatp arg) (osc-insert-float32 arg))
-       ((integerp arg) (osc-insert-int32 arg))
-       ((stringp arg) (osc-insert-string arg))))
-    (process-send-string client (buffer-string))))
+  (process-send-string
+   client
+   (apply
+    'concat
+    (osc-string path)
+    (osc-string
+     (apply
+      'concat ","
+      (mapcar (lambda (arg)
+		(cond
+		 ((floatp arg) "f")
+		 ((integerp arg) "i")
+		 ((stringp arg) "s")
+		 ((vectorp arg) "b")
+		 (t (error "Invalid argument: %S" arg))))
+	      args)))
+    (mapcar
+     (lambda (arg)
+       (cond
+	((floatp arg) (osc-float32 arg))
+	((integerp arg) (osc-int32 arg))
+	((stringp arg) (osc-string arg))
+	((vectorp arg) (osc-blob arg))))
+     args))))
 
 (defun osc-read-string ()
   (let ((pos (point)) string)
@@ -123,6 +136,16 @@
     (setq string (buffer-substring-no-properties pos (point)))
     (forward-char (- 4 (% (length string) 4)))
     string))
+
+(defun osc-read-blob ()
+  (let* ((length (osc-read-int32))
+	 (pos (point))
+	 (vector (progn
+		   (forward-char length)
+		   (string-to-vector (buffer-substring pos (point)))))
+	 (padding (% (- 4 (% length 4)) 4)))
+    (forward-char padding)
+    vector))
 
 (defun osc-read-int32 ()
   (let ((value 0))
@@ -174,13 +197,14 @@ the generic handler for SERVER."
       (goto-char (point-min))
       (let ((path (osc-read-string)))
 	(if (not (string= path "#bundle"))
-	    (when (looking-at ",")
+	    (when (= (char-after) ?,)
 	      (save-excursion
 		(apply (osc-server-get-handler proc path)
 		       path
 		       (mapcar
 			(lambda (type)
 			  (cl-case type
+			    (?b (osc-read-blob))
 			    (?f (osc-read-float32))
 			    (?i (osc-read-int32))
 			    (?s (osc-read-string))))
