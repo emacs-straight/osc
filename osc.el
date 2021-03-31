@@ -3,7 +3,7 @@
 ;; Copyright (C) 2014-2021  Free Software Foundation, Inc.
 
 ;; Author: Mario Lang <mlang@blind.guru>
-;; Version: 0.2
+;; Version: 0.3
 ;; Keywords: comm, processes, multimedia
 
 ;; This program is free software; you can redistribute it and/or modify
@@ -32,10 +32,6 @@
 ;; * `osc-send-message' encodes and sends OSC messages from a client process.
 ;; * `osc-server-set-handler' can be used to change handlers for particular
 ;;   OSC paths on a server process object on the fly.
-
-;; BUGS/TODO:
-;;
-;; * Timetags are not supported yet.
 
 ;; Usage:
 ;;
@@ -92,11 +88,22 @@
       (setq value (/ value 256)))
     (apply 'unibyte-string bytes)))
 
-(defun osc-timetag (time)
-  (cl-multiple-value-bind (high low usec psec) (time-convert time 'list)
-    (concat (osc-int32 (+ 2208988800 (ash high 16) low))
-	    (osc-int32 (round (* (+ (* usec 1e-06) (* psec 1e-12))
-				 (1- (ash 1 32))))))))
+(defconst osc-timetag-now
+  (concat (osc-int32 0) (osc-int32 1)))
+
+(defconst osc-ntp-offset
+  (round
+   (float-time (time-subtract (time-convert 0)
+			      (encode-time '(0 0 0 1 1 1900 nil nil t))))))
+
+(defun osc-timetag (&optional time)
+  (if (not time)
+      osc-timetag-now
+    (pcase (time-convert time 'list)
+      (`(,high ,low ,usec ,psec)
+       (concat (osc-int32 (+ (ash high 16) low osc-ntp-offset))
+	       (osc-int32 (round (* (+ (* usec 1e-06) (* psec 1e-12))
+				    (1- (ash 1 32))))))))))
 
 ;;;###autoload
 (defun osc-make-client (host port)
@@ -141,11 +148,10 @@ string to a vector if embedding in another OSC message is what you want."
   (process-send-string process (apply #'osc-make-message path args)))
 
 (defconst osc-bundle-tag (osc-string "#bundle"))
-(defconst osc-timetag-now (concat (osc-int32 0) (osc-int32 1)))
 
 (defun osc-make-bundle (time &rest messages)
   "Make a bundle with timetag TIME and MESSAGES as payload."
-  (apply #'concat osc-bundle-tag (if time (osc-timetag time) osc-timetag-now)
+  (apply #'concat osc-bundle-tag (osc-timetag time)
 	 (mapcar (lambda (message)
 		   (concat (osc-int32 (length message)) message))
 		 messages)))
@@ -153,7 +159,7 @@ string to a vector if embedding in another OSC message is what you want."
 ;;;###autoload
 (defun osc-send-bundle (process time &rest messages)
   "Send a bundle to PROCESS with timetag TIME and MESSAGES as payload."
-  (process-send-string process (apply #'osc-make-bundle path args)))
+  (process-send-string process (apply #'osc-make-bundle time messages)))
 
 (defun osc-read-string ()
   (let ((pos (point)) string)
@@ -222,8 +228,11 @@ string to a vector if embedding in another OSC message is what you want."
 	 (1+ (/ f (expt 2.0 52))))))))
 
 (defun osc-read-timetag ()
-  (time-add (time-convert (- (osc-read-int32) 2208988800))
-	    (time-convert (cons (osc-read-int32) (ash 1 32)))))
+  (let ((secs (osc-read-int32)) (frac (osc-read-int32)))
+    (if (and (zerop secs) (= frac 1))
+	nil ; now
+      (time-add (time-convert (- secs osc-ntp-offset))
+		(time-convert (cons frac (ash 1 32)))))))
 
 (defun osc-server-set-handler (server path handler)
   "Set HANDLER for PATH on SERVER.
@@ -262,12 +271,12 @@ the generic handler for SERVER."
 			    (?i (osc-read-int32))
 			    (?s (osc-read-string))))
 			(string-to-list (substring (osc-read-string) 1))))))
-	  (forward-char 8) ;skip 64-bit timetag
-	  (while (not (eobp))
-	    (let ((size (osc-read-int32)))
-	      (osc-filter proc
-			  (buffer-substring
-			   (point) (progn (forward-char size) (point)))))))))))
+	  (let ((time (osc-read-timetag)))
+	    (while (not (eobp))
+	      (let* ((size (osc-read-int32))
+		     (data (buffer-substring
+			    (point) (progn (forward-char size) (point)))))
+		(run-at-time time nil #'osc-filter proc data)))))))))
 
 ;;;###autoload
 (defun osc-make-server (host port default-handler)
